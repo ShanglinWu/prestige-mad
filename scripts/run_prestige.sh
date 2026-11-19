@@ -52,9 +52,9 @@ case "$STAGE" in
           --workers "${WORKERS:-3}" --stagger "${STAGGER:-0.45}" --max-retries 8 --policies prestige,all_speak,none
           --store "$STORE" --fresh-against gpqa_main_extra.jsonl:250,gpqa_diamond.jsonl:120)
     echo "About 2,700 round-1 calls plus up to ~9,800 debate calls (two seatings per debate); roughly 1.5 h."
-    echo "Resumes are NOT supported by prestige_mad_v2.py yet: if it stops, start a fresh store (STORE=...)."
+    echo "Resumable: if it stops, rerun this same command and it continues where it left off."
     read -r -p "Run it? [y/N] " ok; [[ "$ok" == "y" || "$ok" == "Y" ]] || exit 0
-    [[ -f "$STORE" ]] && { echo "$STORE already exists; move it away first"; exit 1; }
+    [[ -f "$STORE" ]] && echo "continuing $STORE"
     if command -v caffeinate >/dev/null; then caffeinate -i python3 $MAD "${ARGS[@]}"
     else python3 $MAD "${ARGS[@]}"; fi ;;
   report)

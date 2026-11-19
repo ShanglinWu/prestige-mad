@@ -29,3 +29,6 @@ gpqa250_mixed.jsonl
 logs/
 results.json
 runs/*.jsonl
+runs/*.bak
+runs/*.png
+vllm_logs/

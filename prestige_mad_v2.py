@@ -131,59 +131,113 @@ def build_panel(a):
 
 
 def cmd_run(a):
+    """Resumable: rerun the same command with the same --store and it continues where it stopped.
+    A call that still fails after --max-retries only skips that question/debate for this pass;
+    the run makes up to three passes and tells you if anything is still missing."""
     os.makedirs(os.path.dirname(a.store) or ".", exist_ok=True)
-    store = open(a.store, "a")
-    def emit(r): store.write(json.dumps(r) + "\n"); store.flush()
     probs = (load_jsonl(a.problems, a.n, levels=_levels(a)) if a.problems else synthetic(a.n, 0))[:a.n]
     agents = build_panel(a)
+    for ag in agents:                       # --max-retries applies to every backend (Gemini included)
+        ag.max_retries = a.max_retries
     ids = [ag.agent_id for ag in agents]
-    emit({"kind": "config", "cfg": {"n": a.n, "problems": a.problems, "warmup": a.warmup,
-          "rounds": a.rounds, "policies": a.policies, "agents": ids}})
+    cfg = {"n": a.n, "problems": a.problems, "warmup": a.warmup, "rounds": a.rounds,
+           "policies": a.policies, "agents": ids}
+
+    old = [json.loads(l) for l in open(a.store) if l.strip()] if os.path.exists(a.store) else []
+    if old:
+        ocfg = next((r["cfg"] for r in old if r["kind"] == "config"), {})
+        same = {k: ocfg.get(k) for k in ("n", "problems", "warmup", "rounds", "agents")} == \
+               {k: cfg[k] for k in ("n", "problems", "warmup", "rounds", "agents")}
+        if not same:
+            sys.exit(f"{a.store} was started with different settings {ocfg}; use a new --store")
+        if any(r["kind"] == "r0" and any("rationale" not in t for t in r["turns"].values()) for r in old):
+            sys.exit(f"{a.store} comes from an older version (no round-1 reasoning saved) and cannot be "
+                     f"resumed. Move it away and start again: mv {a.store} {a.store}.old")
+        print(f"resuming {a.store}")
+    store = open(a.store, "a")
+    def emit(r): store.write(json.dumps(r) + "\n"); store.flush()
+    if not old:
+        emit({"kind": "config", "cfg": cfg})
 
     # phase 1: one independent answer per agent per question
-    print(f"round 1: {len(probs)} questions x {len(ids)} agents")
     r1 = [None] * len(probs)
+    for r in old:
+        if r["kind"] == "r0" and r["pid"] < len(probs):
+            r1[r["pid"]] = {aid: AgentTurn(rationale=t["rationale"], answer=t["answer"], confidence=t["confidence"],
+                                           key_uncertainty=t.get("key_uncertainty", ""))
+                            for aid, t in r["turns"].items()}
     def ask(i):
         p = probs[i]
-        with ThreadPoolExecutor(max_workers=len(agents)) as ex:
-            outs = list(ex.map(lambda ag: (ag.agent_id, ag.propose(p, [], None).clipped()), agents))
-        return i, {aid: t for aid, t in outs}
-    with ThreadPoolExecutor(max_workers=a.workers) as ex:
-        for i, turns in ex.map(ask, range(len(probs))):
-            r1[i] = turns
-            emit({"kind": "r0", "pid": i, "qid": _qid(probs[i]), "stem": stem_key(probs[i]["question"]),
-                  "truth": probs[i]["answer"],
-                  "turns": {aid: {"answer": t.answer, "confidence": t.confidence} for aid, t in turns.items()}})
+        try:
+            with ThreadPoolExecutor(max_workers=len(agents)) as ex:
+                outs = list(ex.map(lambda ag: (ag.agent_id, ag.propose(p, [], None).clipped()), agents))
+            return i, {aid: t for aid, t in outs}
+        except Exception as e:
+            print(f"  round 1, question {i}: {str(e)[:120]} (will retry)", flush=True)
+            return i, None
+    for attempt in range(3):
+        todo = [i for i in range(len(probs)) if r1[i] is None]
+        if not todo:
+            break
+        print(f"round 1: {len(todo)} questions x {len(ids)} agents" + (f" (pass {attempt + 1})" if attempt else ""))
+        with ThreadPoolExecutor(max_workers=a.workers) as ex:
+            for i, turns in ex.map(ask, todo):
+                if turns is None:
+                    continue
+                r1[i] = turns
+                emit({"kind": "r0", "pid": i, "qid": _qid(probs[i]), "stem": stem_key(probs[i]["question"]),
+                      "truth": probs[i]["answer"],
+                      "turns": {aid: {"answer": t.answer, "confidence": t.confidence, "rationale": t.rationale}
+                                for aid, t in turns.items()}})
+    missing = [i for i in range(len(probs)) if r1[i] is None]
+    if missing:
+        store.close()
+        sys.exit(f"{len(missing)} questions still lack round-1 answers (API trouble). "
+                 f"Rerun the same command later; it resumes and nothing is lost.")
 
     correct1 = [{aid: answers_match(t.answer, probs[i]["answer"]) for aid, t in r1[i].items()} for i in range(len(probs))]
     path = prestige_path(correct1, ids, a.warmup)
 
     # D = c - p per agent per question (round-1 stated confidence vs prestige-before)
-    for i in range(len(probs)):
-        D = {aid: r1[i][aid].confidence - path[i][aid] for aid in ids}
-        emit({"kind": "D", "pid": i, "D": D, "p": path[i],
-              "c": {aid: r1[i][aid].confidence for aid in ids}})
+    if not any(r["kind"] == "D" for r in old):
+        for i in range(len(probs)):
+            emit({"kind": "D", "pid": i, "D": {aid: r1[i][aid].confidence - path[i][aid] for aid in ids},
+                  "p": path[i], "c": {aid: r1[i][aid].confidence for aid in ids}})
 
-    # phase 2: debates (only contested questions change anything)
-    for pol in a.policies.split(","):
-        if pol == "none":
-            continue
-        todo = [i for i in range(len(probs)) if len({r1[i][aid].answer for aid in ids}) > 1]
-        print(f"policy {pol}: {len(todo)} contested debates")
-        def do(i, pol=pol):
-            q = _qid(probs[i])
-            seats = agents[:]; random.Random(f"seat:{q}").shuffle(seats)     # random seating per question
-            perm = agents[:]; random.Random(f"order:{q}").shuffle(perm)      # a second seating, for flips
+    # phase 2: debates (only contested questions change anything), each in two seatings
+    done = {(r["policy"], r["pid"]) for r in old if r["kind"] == "debate"}
+    def do(i, pol):
+        q = _qid(probs[i])
+        seats = agents[:]; random.Random(f"seat:{q}").shuffle(seats)     # random seating per question
+        perm = agents[:]; random.Random(f"order:{q}").shuffle(perm)      # a second seating, for flips
+        try:
             with ThreadPoolExecutor(max_workers=2) as ex2:
                 f1 = ex2.submit(run_debate, seats, probs[i], path[i], pol, a.rounds, r1[i], i < a.warmup)
                 f2 = ex2.submit(run_debate, perm, probs[i], path[i], pol, a.rounds, r1[i], i < a.warmup)
-                return i, f1.result(), f2.result(), [x.agent_id for x in seats], [x.agent_id for x in perm]
+                return i, pol, f1.result(), f2.result(), [x.agent_id for x in seats], [x.agent_id for x in perm]
+        except Exception as e:
+            print(f"  {pol}, question {i}: {str(e)[:120]} (will retry)", flush=True)
+            return i, pol, None, None, None, None
+    contested = [i for i in range(len(probs)) if len({r1[i][aid].answer for aid in ids}) > 1]
+    pols = [p for p in a.policies.split(",") if p != "none"]
+    for attempt in range(3):
+        todo = [(i, pol) for pol in pols for i in contested if (pol, i) not in done]
+        if not todo:
+            break
+        print(f"debates: {len(todo)} to run ({len(contested)} contested questions x {len(pols)} policies)"
+              + (f" (pass {attempt + 1})" if attempt else ""))
         with ThreadPoolExecutor(max_workers=a.workers) as ex:
-            for i, res, res2, seats, perm in ex.map(do, todo):
+            for i, pol, res, res2, seats, perm in ex.map(lambda x: do(*x), todo):
+                if res is None:
+                    continue
+                done.add((pol, i))
                 emit({"kind": "debate", "policy": pol, "pid": i, "qid": _qid(probs[i]),
                       "truth": probs[i]["answer"], "prestige": path[i],
                       "canon": {**res, "seats": seats}, "order": {**res2, "perm": perm}})
     store.close()
+    left = [(i, pol) for pol in pols for i in contested if (pol, i) not in done]
+    if left:
+        sys.exit(f"{len(left)} debates still missing (API trouble). Rerun the same command later to finish them.")
     print(f"-> {a.store}")
     report(a.store, a.fresh_against)
 
