@@ -1,0 +1,9 @@
+[
+  {"id": "qwen3_8b",      "model": "Qwen/Qwen3-8B",                           "base_url": "http://localhost:8021/v1",
+   "extra_body": {"chat_template_kwargs": {"enable_thinking": false}}},
+  {"id": "ministral3_8b", "model": "mistralai/Ministral-3-8B-Instruct-2512",  "base_url": "http://localhost:8022/v1"},
+  {"id": "nemotron_8b",   "model": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",    "base_url": "http://localhost:8023/v1",
+   "system_prefix": "detailed thinking off"},
+  {"id": "gemma3_4b",     "model": "google/gemma-3-4b-it",                    "base_url": "http://localhost:8024/v1"},
+  {"id": "phi4_mini",     "model": "microsoft/Phi-4-mini-instruct",           "base_url": "http://localhost:8025/v1"}
+]
